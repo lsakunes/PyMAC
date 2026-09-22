@@ -5,8 +5,12 @@ import random
 #import sympy as sp
 import matplotlib.pyplot as plt
 from PIL import Image
+from multiprocessing import Pool, shared_memory
+from functools import partial
 import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning)
+import os
+num_cores = os.cpu_count()
 
 # WORLD AND CAMERA COORDS HAVE Z FORWARD Y UP
 
@@ -281,7 +285,27 @@ def subpixelDiff(dir, origin, colorIn, img):
 #endregion
 
 
-
+def thingy(shm_name, shape, dtype, offset):
+    shm = shared_memory.SharedMemory(name=shm_name)
+    a = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
+    i = 0
+    j = offset
+    while i < xResolution:
+        while j < yResolution:
+            x, y = KInv(i, j)
+            vec = np.array([x,y,1])
+            vec = vec/np.linalg.norm(vec)
+            dist = np.linalg.norm(rc)
+            brightness, surface = earth(axes[0], rc, vec, sunc)
+            a[j][i] = brightness * 100
+            a[j][i] += (atmos(axes[0]+atmosphere, rc, vec, sunc, surface))*100
+            print(f"{i},{j} from thread {offset}")
+            if (a[j][i] > 100):
+                a[j][i] = 100
+            j += num_cores
+        j = offset
+        i += 1
+    shm.close()
 
 #region GRAPHICS
 def box(pt, pts, color, size):
@@ -291,19 +315,15 @@ def box(pt, pts, color, size):
                 return 0
     return color  
 
-a = np.zeros((xResolution, yResolution), dtype=np.uint8)
-for i in range(xResolution):
-    for j in range(yResolution):
-        x, y = KInv(i, j)
-        vec = np.array([x,y,1])
-        vec = vec/np.linalg.norm(vec)
-        dist = np.linalg.norm(rc)
-        brightness, surface = earth(axes[0], rc, vec, sunc)
-        a[j][i] = brightness * 100
-        a[j][i] += (atmos(axes[0]+atmosphere, rc, vec, sunc, surface))*100
-            #print(f"{i},{j}")
-        if (a[j][i] > 100):
-            a[j][i] = 100
+shm = shared_memory.SharedMemory(create=True, size=xResolution*yResolution)
+a = np.ndarray((xResolution, yResolution), dtype=np.uint8, buffer=shm.buf)
+a[:] = 0
+with Pool(num_cores) as p:
+        p.map(partial(thingy, shm.name, a.shape, a.dtype), range(num_cores))
+a = a.copy()
+shm.close()
+shm.unlink()
+
         #a[i][j] = box((i,j), pts, a[i][j], 3)
         # if (i % 20 == 0 or j % 20 == 0):
         #     a[i][j] = 100 - a[i][j]
