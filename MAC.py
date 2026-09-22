@@ -1,3 +1,4 @@
+from atmos import Ray, calculateAtmosphericDimming
 import numpy as np
 import cv2 as cv
 import random
@@ -160,28 +161,48 @@ def earth(radius, pos, dir, sun):
 def atmos(radius, pos, dir, sun, surface):
     dot = dir.dot(pos)
     det = (2*dot)**2 - 4*(pos.dot(pos)-radius*radius)
-    if (det < 0):
+    if det < 0:
         return 0
-    
     d1 = (dot + np.sqrt(det)/2)
     d2 = (dot - np.sqrt(det)/2)
-    
-    if (d1<0 or d2<0):
+    if d1 < 0 or d2 < 0:
         return 0
+    # nearer / farther intersection along this ray convention
+    t_near = min(d1, d2)
+    t_far = max(d1, d2)
+    if surface > 0:
+        t_far = min(t_far, surface)  # stop at ground
+    startPoint = (pos - t_near * dir) * 1000.0  # km → m
+    endPoint = (pos - t_far * dir) * 1000.0
 
-    normPos = (pos/np.linalg.norm(pos))
-    atmosDir = (dir - dir.dot(normPos)*normPos)
-    atmosDir = atmosDir/(np.linalg.norm(atmosDir))
-    dot = -atmosDir.dot(sun)
-    if (dot>1):
-        print(dot)
-    if (dot < 0):
-        return 0
-    if (surface > 0):
-        if (abs(d1) > abs(d2)):
-            d1 = d2
-        return (abs(d1-surface)/(np.sqrt(radius**2-Ac[0,0]**2)/2)) * dot
-    return (abs(d1-d2)/(np.sqrt(radius**2-Ac[0,0]**2)/2)) * dot
+    result = calculateAtmosphericDimming(startPoint, endPoint, sun)
+    return result.inscatter + result.outscatter * np.dot(startPoint / np.linalg.norm(startPoint), (-sun) / np.linalg.norm(-sun))
+
+# def atmos(radius, pos, dir, sun, surface):
+#     dot = dir.dot(pos)
+#     det = (2*dot)**2 - 4*(pos.dot(pos)-radius*radius)
+#     if (det < 0):
+#         return 0
+    
+#     d1 = (dot + np.sqrt(det)/2)
+#     d2 = (dot - np.sqrt(det)/2)
+    
+#     if (d1<0 or d2<0):
+#         return 0
+
+#     normPos = (pos/np.linalg.norm(pos))
+#     atmosDir = (dir - dir.dot(normPos)*normPos)
+#     atmosDir = atmosDir/(np.linalg.norm(atmosDir))
+#     dot = -atmosDir.dot(sun)
+#     if (dot>1):
+#         print(dot)
+#     if (dot < 0):
+#         return 0
+#     if (surface > 0):
+#         if (abs(d1) > abs(d2)):
+#             d1 = d2
+#         return (abs(d1-surface)/(np.sqrt(radius**2-Ac[0,0]**2)/2)) * dot
+#     return (abs(d1-d2)/(np.sqrt(radius**2-Ac[0,0]**2)/2)) * dot
 
 # in pixel coords
 def rayConicIntersection(c, pixel, dir):
