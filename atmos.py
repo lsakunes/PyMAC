@@ -1,4 +1,3 @@
-from math import exp
 import numpy as np
 from dataclasses import dataclass
 
@@ -15,30 +14,41 @@ ATMOSPHERE_HEIGHT = 6356752 + 11000*1
 DEG_TO_RAD = 3.14159265358979 / 180.0
 RAD_TO_DEG = 180.0 / 3.14159265358979
 
+NUM_SCATTER_POINTS = 3
+SIGMA = np.array([0.33, 0.78, 1.89])
+S_R = 0.17
+SCALE_HEIGHT_RAYLEIGH = 2750
+
 PI = 3.14159265358979323846264338327950288419716939937510582
 
 @dataclass
 class Ray:
-    origin: np.array
-    direction: np.array
+    origin: np.ndarray
+    direction: np.ndarray
 
 @dataclass
 class SimpleRaycastResult:
     collides: bool
-    position: np.array
+    position: np.ndarray
 
 @dataclass
 class ComplexRaycastResult:
-    firstPosition: np.array
+    firstPosition: np.ndarray
     collidesFirst: bool
 
-    secondPosition: np.array
+    secondPosition: np.ndarray
     collidesSecond: bool
 
 @dataclass
 class scatterResult:
-    outscatter: np.array
-    inscatter: np.array
+    outscatter: np.ndarray
+    inscatter: np.ndarray
+
+LUMINANCE_WEIGHTS = np.array([0.2126, 0.7152, 0.0722])
+
+def luminance(rgb) -> float:
+    rgb = np.asarray(rgb, dtype=np.float64)
+    return float(np.dot(rgb, LUMINANCE_WEIGHTS))
 
 # Calculates both collision positions for the raycast
 def castRayAgainstOblateSpheroidFull(ray, width, height):
@@ -92,37 +102,17 @@ def castRayAgainstOblateSpheroid(ray, width, height):
     return SimpleRaycastResult(collides=raycastResult.collidesFirst, position=raycastResult.firstPosition)
 
 # Coordinate Conversions
-def convertPosToSphereSpace(pos: np.array) -> np.array:
-    return np.array([pos[0], pos[1], pos[2] * widthOverHeight])
-
-def convertPosToSphereSpace(pos: np.array, width: float, height: float) -> np.array:
+def convertPosToSphereSpace(pos: np.ndarray, width: float, height: float) -> np.ndarray:
     return np.array([pos[0], pos[1], pos[2] * (width / height)])
 
-def convertPosToEllipsoidSpace(pos: np.array) -> np.array:
-    return np.array([pos[0], pos[1], pos[2] / widthOverHeight])
-
-def convertPosToEllipsoidSpace(pos: np.array, width: float, height: float) -> np.array:
+def convertPosToEllipsoidSpace(pos: np.ndarray, width: float, height: float) -> np.ndarray:
     return np.array([pos[0], pos[1], pos[2] / (width / height)])
-
-def convertRayToSphereSpace(ray: Ray) -> Ray:
-    vector = np.array([ray.direction[0], ray.direction[1], ray.direction[2] * widthOverHeight])
-    return Ray(
-        np.array([ray.origin[0], ray.origin[1], ray.origin[2] * widthOverHeight]),
-        vector / np.linalg.norm(vector)
-    )
 
 def convertRayToSphereSpace(ray: Ray, width: float, height: float) -> Ray:
     widthDivHeight = width / height
     vector = np.array([ray.direction[0], ray.direction[1], ray.direction[2] * widthDivHeight])
     return Ray(
         np.array([ray.origin[0], ray.origin[1], ray.origin[2] * widthDivHeight]),
-        vector / np.linalg.norm(vector)
-    )
-
-def convertRayToEllipsoidSpace(ray: Ray) -> Ray:
-    vector = np.array([ray.direction[0], ray.direction[1], ray.direction[2] / widthOverHeight])
-    return Ray(
-        np.array([ray.origin[0], ray.origin[1], ray.origin[2] / widthOverHeight]),
         vector / np.linalg.norm(vector)
     )
 
@@ -134,12 +124,38 @@ def convertRayToEllipsoidSpace(ray: Ray, width: float, height: float) -> Ray:
         vector / np.linalg.norm(vector)
     )
 
+def _mac_ray(pos_km, dir_unit):
+    """MAC traces pos - t*dir; oblate cast uses origin + t*direction."""
+    return Ray(pos_km * 1000.0, -dir_unit)
 
-# CONSTANTS
-NUM_SCATTER_POINTS = 1
-SIGMA = np.array([0.33, 0.78, 1.89])
-S_R = 0.17
-SCALE_HEIGHT_RAYLEIGH = 2750
+
+def earth_hit_km(pos_km, dir_unit):
+    """Returns (surface_point_km, distance_km) or None."""
+    ray = _mac_ray(pos_km, dir_unit)
+    hit = castRayAgainstOblateSpheroidFull(ray, EARTH_WIDTH, EARTH_HEIGHT)
+    if not hit.collidesFirst:
+        return None
+
+    surface_m = hit.firstPosition
+    distance_km = np.linalg.norm(pos_km * 1000.0 - surface_m) / 1000.0
+    return surface_m / 1000.0, distance_km
+
+
+def atmosphere_segment_m(pos_km, dir_unit, sun_unit=None):
+    """Returns (start_m, end_m, path_kind) or None. path_kind is 'earth' or 'limb'."""
+    del sun_unit  # reserved for future use; kept for MAC adapter signature parity
+    ray = _mac_ray(pos_km, dir_unit)
+
+    earth_hit = castRayAgainstOblateSpheroidFull(ray, EARTH_WIDTH, EARTH_HEIGHT)
+    atmos_hit = castRayAgainstOblateSpheroidFull(ray, ATMOSPHERE_WIDTH, ATMOSPHERE_HEIGHT)
+
+    if earth_hit.collidesFirst and atmos_hit.collidesFirst:
+        return atmos_hit.firstPosition, earth_hit.firstPosition, "earth"
+
+    if atmos_hit.collidesFirst and atmos_hit.collidesSecond and not earth_hit.collidesFirst:
+        return atmos_hit.firstPosition, atmos_hit.secondPosition, "limb"
+
+    return None
 
 
 # Returns atmospheric density at a given altitude
@@ -193,6 +209,8 @@ def calculateAtmosphericDimming(startPoint, endPoint, sunDirection):
     epsilon = 10
     viewVector = endPoint - startPoint
     viewVectorMagnitude = np.linalg.norm(viewVector)
+    if viewVectorMagnitude <= 0.0:
+        return scatterResult(outscatter=np.ones(3), inscatter=np.zeros(3))
     viewDirection = viewVector / viewVectorMagnitude
     stepSize = viewVectorMagnitude / float(NUM_SCATTER_POINTS)
 
@@ -205,7 +223,9 @@ def calculateAtmosphericDimming(startPoint, endPoint, sunDirection):
     # iterating through sample points from start to end
     for i in range(NUM_SCATTER_POINTS):
         t = float(i) * stepSize
-        point = startPoint + (t == 0.0 if epsilon else (t == viewVectorMagnitude if t - epsilon else t)) * viewDirection
+        # slang: (t == 0 ? epsilon : (t == viewVectorMagnitude ? t - epsilon : t))
+        t_sample = epsilon if t == 0.0 else (t - epsilon if t == viewVectorMagnitude else t)
+        point = startPoint + t_sample * viewDirection
 
         # Sun Length calculation
         sunRay = Ray(point, -sunDirection)
@@ -227,9 +247,9 @@ def calculateAtmosphericDimming(startPoint, endPoint, sunDirection):
             scatteredSunIntoViewRay = np.array([1.0, 1.0, 1.0]) * localDensity * transmittance * phase * sigma_r
             inScatteredLight += scatteredSunIntoViewRay * stepSize
 
-    return scatterResult(outscatter=1, inscatter=1)
-
     # float3 outScatterFactor = exp(-densityAccum * 0.001 * sigma_r); // sigma_r *
+    outScatterFactor = np.exp(-densityAccum * 0.001 * sigma_r)
+    return scatterResult(outscatter=outScatterFactor, inscatter=inScatteredLight)
     # return scatterResult(outScatterFactor, inScatteredLight);
     # return rayBrightness + inScatteredLight; #densityAccum * 0.0001;
     # return densityAccum * 0.0001;
