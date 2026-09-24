@@ -167,15 +167,23 @@ def atmos(radius, pos, dir, sun, surface):
         return 0.0
 
     start_m, end_m, path_kind = segment
-    result = calculateAtmosphericDimming(start_m, end_m, sun)
 
+    # Limb-only rays (miss earth): MAC N·sun lights the left/day side, but atmos.py
+    # casts sun rays along -sunDirection. Pass -sun so the glow sits on the lit limb.
     if path_kind == "limb":
+        result = calculateAtmosphericDimming(start_m, end_m, -sun)
         return luminance(result.inscatter)
+
+    result = calculateAtmosphericDimming(start_m, end_m, sun)
 
     surface_ndotl = max(
         0.0,
         np.dot(end_m / np.linalg.norm(end_m), sun / np.linalg.norm(sun)),
     )
+    # Night disk: no airglow wash; limb path above still contributes
+    if surface_ndotl <= 0.0:
+        return 0.0
+
     gray = 1.0
     combined = result.inscatter + result.outscatter * gray * surface_ndotl
     return float(luminance(combined) - surface_ndotl)
