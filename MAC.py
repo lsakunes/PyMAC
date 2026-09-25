@@ -1,8 +1,10 @@
+#region imports
 from atmos import (
     calculateAtmosphericDimming,
     earth_hit_km,
     atmosphere_segment_m,
     luminance,
+    RGB,
 )
 import numpy as np
 import cv2 as cv
@@ -16,14 +18,46 @@ import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 import os
 num_cores = os.cpu_count()
+#endregion
 
-# WORLD AND CAMERA COORDS HAVE Z FORWARD Y UP
+
+
+
 
 #region PARAMETERS
-#EARTH
-axes = [6378.137, 6378.137, 6356.752]  # WGS84 equatorial / polar, km
 
-#CAMERA
+# !! WORLD AND CAMERA COORDS HAVE Z FORWARD Y UP
+
+
+#### SUN/EARTH ##############################
+sunAngle = 0.4
+sun = np.array([0,np.sin(sunAngle),np.cos(sunAngle)])
+
+axes = [6378.137, 6378.137, 6356.752]  # WGS84 equatorial / polar, km
+atmosphere = 11  # km shell thickness (matches old ATMOSPHERE_* offset)
+
+## includes atmosphere cause that what edge detection thinks is the horizon
+diagAxes = np.array([ [(axes[0])+atmosphere,              0,             0  ],
+                      [      0,          (axes[1])+atmosphere,           0  ],
+                      [      0,                0,       (axes[2])+atmosphere]])
+
+diagInvAxes = np.array([ [1/(axes[0]+atmosphere),         0,               0      ],
+                      [      0,          1/(axes[1]+atmosphere),        0      ],
+                      [      0,                 0,       1/(axes[2]+atmosphere)]])
+
+## for when we apply MAC and start working with the actual horizon
+diagTrueAxes = np.array([ [(axes[0]),              0,             0  ],
+                      [      0,          (axes[1]),           0  ],
+                      [      0,                0,       (axes[2])]])
+
+diagTrueInvAxes = np.array([ [1/(axes[0]),         0,               0      ],
+                      [      0,          1/(axes[1]),        0      ],
+                      [      0,                 0,       1/(axes[2])]])
+
+Ap = diagTrueInvAxes*diagTrueInvAxes
+#############################################
+
+### CAMERA INTRINSICS #######################
 focalLength     = 50 * 0.001 # 50mm to m
 sensorWidth     = 36 * 0.001 # 36mm to m
 sensorHeight    = 36 * 0.001 # 36mm to m
@@ -34,8 +68,9 @@ xPitch = sensorWidth/xResolution
 yPitch = sensorWidth/yResolution
 dx = focalLength/xPitch
 dy = focalLength/yPitch
+#############################################
 
-
+### CAMERA POSITION/ORIENTATION #############
 thetay = -80
 thetax = 0
 TPCY = np.array([[np.cos(thetay),  0,  np.sin(thetay)],
@@ -47,28 +82,7 @@ TPCX = np.array([[1,  0,  0],
                 [0, np.sin(thetax),  np.cos(thetax)]])
 TPC = TPCX.dot(TPCY)
 TCP = np.linalg.matrix_transpose(TPC)
-artemisOffset = 95
 
-diagAxes = np.array([ [(axes[0])+artemisOffset,              0,             0  ],
-                      [      0,          (axes[1])+artemisOffset,           0  ],
-                      [      0,                0,       (axes[2])+artemisOffset]])
-
-diagInvAxes = np.array([ [1/(axes[0]+artemisOffset),         0,               0      ],
-                      [      0,          1/(axes[1]+artemisOffset),        0      ],
-                      [      0,                 0,       1/(axes[2]+artemisOffset)]])
-
-diagTrueAxes = np.array([ [(axes[0]),              0,             0  ],
-                      [      0,          (axes[1]),           0  ],
-                      [      0,                0,       (axes[2])]])
-
-diagTrueInvAxes = np.array([ [1/(axes[0]),         0,               0      ],
-                      [      0,          1/(axes[1]),        0      ],
-                      [      0,                 0,       1/(axes[2])]])
-
-Ap = np.array([ [(1/axes[0])**2,         0,               0     ],
-                [        0,      (1/axes[1])**2,          0     ],
-                [        0,              0,       (1/axes[2])**2]])
-Ac = TPC.dot(Ap.dot(TCP))
 
 KMat = np.array([[dx, 0, xResolution/2],
                  [0, dy, yResolution/2],
@@ -78,23 +92,23 @@ invKMat = np.array([[1/dx, 0, -xResolution/(2*dx)],
                     [0,0,1]])
 
 
-# just move backwards
+## position in world coords
 rp = np.array([-30000,0,0])
+## position in camera coords
 rc = TPC.dot(rp)
-
-rpEstimate = -1*np.array([0,0,-axes[0]-158])
-rcEstimate = TPC.dot(rpEstimate)
-
-
-C = ((np.outer(Ac.dot(rc),(Ac.dot(rc))) - (rc.dot(Ac.dot(rc)) * np.eye(3) - np.eye(3)).dot(Ac))*10**8)*-1
-
-sunAngle = 0.4
-sun = np.array([0,np.sin(sunAngle),np.cos(sunAngle)])
+## sun vector in camera coords
 sunc = TPC.dot(sun)
+## sun in image coords
 sunimgBad = np.array([sunc[0], sunc[1]])
+#normalized
 sunImg = sunimgBad/np.linalg.norm(sunimgBad)
 
-atmosphere = 11  # km shell thickness (matches old ATMOSPHERE_* offset)
+Ac = TPC.dot(Ap.dot(TCP))
+
+## the conic section we see 
+C = ((np.outer(Ac.dot(rc),(Ac.dot(rc))) - (rc.dot(Ac.dot(rc)) * np.eye(3) - np.eye(3)).dot(Ac))*10**8)*-1
+#############################################
+
 #endregion
 
 
@@ -104,6 +118,7 @@ atmosphere = 11  # km shell thickness (matches old ATMOSPHERE_* offset)
 def minPosQuadratic(a, b, c):
     discriminant = (b*b - 4*a*c)
     if (discriminant<0):
+        # put in funky numbers for debugging
         return -88888
     x1 = (-b + np.sqrt(discriminant))/(2*a)
     x2 = (-b - np.sqrt(discriminant))/(2*a)
@@ -115,6 +130,7 @@ def minPosQuadratic(a, b, c):
         return x1
     return np.min([x1, x2])
 
+# returns the root with the smallest magnitude
 def minAbsQuadratic(a, b, c):
     discriminant = (b*b - 4*a*c)
     if (discriminant<0):
@@ -123,6 +139,7 @@ def minAbsQuadratic(a, b, c):
     x2 = (-b - np.sqrt(discriminant))/(2*a)
     return x1 if (abs(x1) < abs(x2)) else x2
 
+# world to image coords
 def K(x, y):
     u = dx*x + xResolution/2
     v = dy*y + yResolution/2
@@ -143,34 +160,34 @@ def insideEarth(x, y, _C, _det):
     if (xBar.dot(rc) < 0):
         return 0
     if (xBar.dot(_C.dot(xBar))*-np.sign(_det) < 0):
-        return 100
+        return 1
     return 0
 
-def earth(radius, pos, dir, sun):
-    del radius  # geometry comes from atmos.py WGS84 constants
+# camera position in world coords earth center
+def earth(pos, dir, sun):
     hit = earth_hit_km(pos, dir)
     if hit is None:
-        return 0, 0
+        return 0
 
-    surface_km, distance_km = hit
+    surface_km = hit
     surface_dir = surface_km / np.linalg.norm(surface_km)
     ndotl = surface_dir.dot(sun)
     if ndotl < 0:
-        return 0, distance_km
-    return ndotl, distance_km
+        return 0
+    return ndotl
 
-def atmos(radius, pos, dir, sun, surface):
-    del radius, surface  # geometry comes from atmos.py; surface kept for call-site compatibility
+def atmos(pos, dir, sun):
+    """Returns the atmosphere's RGB contribution along this ray (an additive sky/dimming color)."""
 
     segment = atmosphere_segment_m(pos, dir, sun)
     if segment is None:
-        return 0.0
+        return RGB.zeros()
 
     start_m, end_m, path_kind = segment
     result = calculateAtmosphericDimming(start_m, end_m, sun)
 
     if path_kind == "limb":
-        return luminance(result.inscatter)
+        return result.inscatter
 
     surface_ndotl = max(
         0.0,
@@ -178,33 +195,10 @@ def atmos(radius, pos, dir, sun, surface):
     )
     gray = 1.0
     combined = result.inscatter + result.outscatter * gray * surface_ndotl
-    return float(luminance(combined) - surface_ndotl)
+    return combined - RGB.ones() * surface_ndotl
 
-# def atmos(radius, pos, dir, sun, surface):
-#     dot = dir.dot(pos)
-#     det = (2*dot)**2 - 4*(pos.dot(pos)-radius*radius)
-#     if (det < 0):
-#         return 0
-    
-#     d1 = (dot + np.sqrt(det)/2)
-#     d2 = (dot - np.sqrt(det)/2)
-    
-#     if (d1<0 or d2<0):
-#         return 0
-
-#     normPos = (pos/np.linalg.norm(pos))
-#     atmosDir = (dir - dir.dot(normPos)*normPos)
-#     atmosDir = atmosDir/(np.linalg.norm(atmosDir))
-#     dot = -atmosDir.dot(sun)
-#     if (dot>1):
-#         print(dot)
-#     if (dot < 0):
-#         return 0
-#     if (surface > 0):
-#         if (abs(d1) > abs(d2)):
-#             d1 = d2
-#         return (abs(d1-surface)/(np.sqrt(radius**2-Ac[0,0]**2)/2)) * dot
-#     return (abs(d1-d2)/(np.sqrt(radius**2-Ac[0,0]**2)/2)) * dot
+def rgb_to_channels(color: RGB) -> np.ndarray:
+    return np.array([color.r, color.g, color.b], dtype=np.float64)
 
 # in pixel coords
 def rayConicIntersection(c, pixel, dir):
@@ -230,19 +224,11 @@ def subpixelDiff(dir, origin, colorIn, img):
     horizontalSign = np.sign(dir[0])
     verticalSign = np.sign(dir[1])
     renorm = 1
-
-    #color = np.int32(model[origin[1], origin[0]])
     color = np.int32(colorIn)
     start = np.int32(midPixColor(img, origin[0], origin[1]))
     corner = np.int32(midPixColor(img, origin[0]+horizontalSign, origin[1]+verticalSign))
     yPixel = np.int32(midPixColor(img, origin[0], origin[1]+verticalSign))
     xPixel = np.int32(midPixColor(img, origin[0]+horizontalSign, origin[1]))
-
-    # print(f"\n\n{(origin[1], origin[0])} : {start}")
-    # print(f"{(origin[1]+verticalSign, origin[0]+horizontalSign)} : {corner}")
-    # print(f"{(origin[1], origin[0]+horizontalSign)} : {xPixel}")
-    # print(f"{(origin[1]+verticalSign, origin[0])} : {yPixel}")
-
     if (start == color):
         return 0
     
@@ -265,7 +251,6 @@ def subpixelDiff(dir, origin, colorIn, img):
             return 0
         # basically linear
         return (color-start)/(xPixel-start)
-    # print(f"\na,b,c: {a},{b},{c} -> {color}")
     t = minAbsQuadratic(a,b,c)
     if (t == -99999): 
         print(f"\n\ncolor: {color}")
@@ -275,17 +260,16 @@ def subpixelDiff(dir, origin, colorIn, img):
         print(f"corner: {corner}")
         print(f"dir: {dir}")
         raise Exception("dumbass")
-    # print(f"\nrenorm:\t{renorm}")
-    # print(f"t:\t{t}")
-    # print(f"result:\t{t/renorm}\n")
     return t/renorm
 
 #endregion
 
 
-def thingy(shm_name, shape, dtype, offset):
+def thingy(shm_name, shape, dtype, shm_color_name, color_shape, color_dtype, offset):
     shm = shared_memory.SharedMemory(name=shm_name)
     a = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
+    shmColor = shared_memory.SharedMemory(name=shm_color_name)
+    aColor = np.ndarray(color_shape, dtype=color_dtype, buffer=shmColor.buf)
     i = 0
     j = offset
     while i < xResolution:
@@ -293,17 +277,22 @@ def thingy(shm_name, shape, dtype, offset):
             x, y = KInv(i, j)
             vec = np.array([x,y,1])
             vec = vec/np.linalg.norm(vec)
-            dist = np.linalg.norm(rc)
-            brightness, surface = earth(axes[0], rc, vec, sunc)
-            a[j][i] = brightness * 100
-            a[j][i] += (atmos(axes[0]+atmosphere, rc, vec, sunc, surface))*100
-            print(f"{i},{j} from thread {offset}")
-            if (a[j][i] > 100):
-                a[j][i] = 100
+            brightness = earth(rp, vec, sunc)
+            a[j][i] = brightness * 255
+            atmosColor = atmos(rc, vec, -sunc)
+            atmo = luminance(atmosColor) * 255
+            a[j][i] = max(atmo+a[i][j], 0)
+            colorPixel = np.clip((brightness * 255) + rgb_to_channels(atmosColor) * 255, 0, 255)
+            aColor[j][i] = colorPixel
+            if (i%10 == 0 and j%255 == 0):
+                print(f"{i},{j} from thread {offset}")
+            if (a[j][i] > 255):
+                a[j][i] = 255
             j += num_cores
         j = offset
         i += 1
     shm.close()
+    shmColor.close()
 
 #region GRAPHICS
 def box(pt, pts, color, size):
@@ -318,17 +307,21 @@ if __name__ == "__main__":
     shm = shared_memory.SharedMemory(create=True, size=xResolution*yResolution)
     a = np.ndarray((xResolution, yResolution), dtype=np.uint8, buffer=shm.buf)
     a[:] = 0
+    shmColor = shared_memory.SharedMemory(create=True, size=xResolution*yResolution*3)
+    aColor = np.ndarray((xResolution, yResolution, 3), dtype=np.uint8, buffer=shmColor.buf)
+    aColor[:] = 0
     with Pool(num_cores) as p:
-            p.map(partial(thingy, shm.name, a.shape, a.dtype), range(num_cores))
+            p.map(partial(thingy, shm.name, a.shape, a.dtype, shmColor.name, aColor.shape, aColor.dtype), range(num_cores))
     a = a.copy()
+    aColor = aColor.copy()
     shm.close()
     shm.unlink()
+    shmColor.close()
+    shmColor.unlink()
 
-            #a[i][j] = box((i,j), pts, a[i][j], 3)
-            # if (i % 20 == 0 or j % 20 == 0):
-            #     a[i][j] = 100 - a[i][j]
     a=cv.GaussianBlur(a, (3, 3), 0)
-    img = Image.fromarray(a)
+    aColor=cv.GaussianBlur(aColor, (3, 3), 0)
+    img = Image.fromarray(aColor)
     img.save("./output.png")
     #endregion
 
@@ -370,10 +363,10 @@ if __name__ == "__main__":
                     pts.append([pt[0], pt[1]])
                 break
         scan += 1
-    img = Image.fromarray(gradDraw)
+    img = Image.fromarray(cv.cvtColor(gradDraw, cv.COLOR_GRAY2RGB))
     img.save("./grad.jpg")
 
-    img = Image.fromarray(a)
+    img = Image.fromarray(aColor)
     img.save("./outputEdge.png")
     #endregion
 
@@ -407,6 +400,7 @@ if __name__ == "__main__":
 
     #region ATMOS
     b = np.zeros((xResolution, yResolution), dtype=np.uint8)
+    bColor = np.zeros((xResolution, yResolution, 3), dtype=np.uint8)
     ptBrightness = []
 
     for i in range(xResolution):
@@ -415,13 +409,16 @@ if __name__ == "__main__":
             vec = np.array([x,y,1])
             vec = vec/np.linalg.norm(vec)
             dist = np.linalg.norm(rc)
-            brightness, surface = earth(axes[0], vecToEarth, vec, sunc)
-            b[j][i] = brightness * 100
-            b[j][i] += (atmos(axes[0]+atmosphere, vecToEarth, vec, sunc, surface))*100
-            if (b[j][i] > 100):
-                b[j][i] = 100
+            brightness, surface = earth(vecToEarth, vec, sunc)
+            b[j][i] = brightness * 255
+            atmosColor = atmos(vecToEarth, vec, sunc)
+            b[j][i] += (luminance(atmosColor))*255
+            bColor[j][i] = np.clip((brightness * 255) + rgb_to_channels(atmosColor) * 255, 0, 255)
+            if (b[j][i] > 255):
+                b[j][i] = 255
     b=cv.GaussianBlur(b, (3, 3), 0)
-    modelVisual = Image.fromarray(b)
+    bColor=cv.GaussianBlur(bColor, (3, 3), 0)
+    modelVisual = Image.fromarray(bColor)
     modelVisual.save("./model.png")
 
     kernel1d = cv.getGaussianKernel(3, 0)
@@ -435,29 +432,33 @@ if __name__ == "__main__":
                 vec = np.array([x,y,1])
                 vec = vec/np.linalg.norm(vec)
                 dist = np.linalg.norm(rc)
-                dummy, surface = earth(axes[0], vecToEarth, vec, sunc)
-                brightness += ((atmos(axes[0]+atmosphere, vecToEarth, vec, sunc, surface))*100) * kernel2d[k][l]
-        if (brightness > 100):
-                brightness = 100
+                dummy, surface = earth(vecToEarth, vec, sunc)
+                brightness += (luminance(atmos(vecToEarth, vec, sunc))*255) * kernel2d[k][l]
+        if (brightness > 255):
+                brightness = 255
         ptBrightness.append(brightness)
         brightness = 0
+        colorBrightness = np.zeros(3)
         for k in range(3):
             for l in range(3):
                 x, y = KInv((int)(pt[0])+k-1, (int)(pt[1])+l-1)
                 vec = np.array([x,y,1])
                 vec = vec/np.linalg.norm(vec)
                 dist = np.linalg.norm(rc)
-                dummy, surface = earth(axes[0], vecToEarth, vec, sunc)
-                brightness += ((atmos(axes[0]+atmosphere, vecToEarth, vec, sunc, surface))*100) * kernel2d[k][l]
+                dummy, surface = earth(vecToEarth, vec, sunc)
+                atmosColor = atmos(vecToEarth, vec, sunc)
+                brightness += (luminance(atmosColor)*255) * kernel2d[k][l]
+                colorBrightness += (rgb_to_channels(atmosColor)*255) * kernel2d[k][l]
         b[(int)(pt[1]), (int)(pt[0])] = brightness
+        bColor[(int)(pt[1]), (int)(pt[0])] = np.clip(colorBrightness, 0, 255)
 
-    modelVisual = Image.fromarray(b)
+    modelVisual = Image.fromarray(bColor)
     modelVisual.save("./modelEdge.png")
     c = np.zeros((xResolution, yResolution), dtype=np.uint8)
     for i in range(xResolution):
         for j in range(yResolution):
-            c[j][i] = (100+a[i][j]-b[i][j])
-    diff = Image.fromarray(c)
+            c[j][i] = (255+a[i][j]-b[i][j])
+    diff = Image.fromarray(cv.cvtColor(c, cv.COLOR_GRAY2RGB))
     diff.save("./diff.png")
     #endregion
 
@@ -465,10 +466,6 @@ if __name__ == "__main__":
 
 
     #region MATCH
-
-
-    #ptOffset = np.zeros((len(pts), 2), dtype=np.uint8)
-    #ptOffsetGrad = np.zeros((len(pts), 2), dtype=np.uint8)
     normOffsets = np.zeros((len(pts), 2), dtype=np.float32)
     lambdas = np.zeros((len(pts)), dtype=np.float32)
     moveSum = 0
@@ -481,9 +478,6 @@ if __name__ == "__main__":
         normOffsets[i] = normOffset
         lambd = rayConicIntersection(Cuv, pt, normOffset)
         lambdas[i] = lambd
-        #ptOffset[i] = offset
-        # moveSum += grad_x[(int)(y)][(int)(x)] * normOffset[0] + grad_y[(int)(y)][(int)(x)] * normOffset[1]
-        # print(f"{(int)(pt[0])},{(int)(pt[1])} diff {(int)(pt[0])-pt[0]},{(int)(pt[1])-pt[1]}: {ptBrightness[i] - b[(int)(y)][(int)(x)]}")
         diff = subpixelDiff(normOffset, (x, y), ptBrightness[i], a) #b[(int)(y)][(int)(x)]
         moveSum += diff
         i += 1

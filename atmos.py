@@ -15,7 +15,44 @@ DEG_TO_RAD = 3.14159265358979 / 180.0
 RAD_TO_DEG = 180.0 / 3.14159265358979
 
 NUM_SCATTER_POINTS = 3
-SIGMA = np.array([0.33, 0.78, 1.89])
+
+@dataclass
+class RGB:
+    r: float
+    g: float
+    b: float
+
+    def __add__(self, other: "RGB") -> "RGB":
+        return RGB(self.r + other.r, self.g + other.g, self.b + other.b)
+
+    def __sub__(self, other: "RGB") -> "RGB":
+        return RGB(self.r - other.r, self.g - other.g, self.b - other.b)
+
+    def __neg__(self) -> "RGB":
+        return RGB(-self.r, -self.g, -self.b)
+
+    def __mul__(self, other) -> "RGB":
+        if isinstance(other, RGB):
+            return RGB(self.r * other.r, self.g * other.g, self.b * other.b)
+        return RGB(self.r * other, self.g * other, self.b * other)
+
+    __rmul__ = __mul__
+
+    def exp(self) -> "RGB":
+        return RGB(np.exp(self.r), np.exp(self.g), np.exp(self.b))
+
+    def dot(self, other: "RGB") -> float:
+        return self.r * other.r + self.g * other.g + self.b * other.b
+
+    @staticmethod
+    def zeros() -> "RGB":
+        return RGB(0.0, 0.0, 0.0)
+
+    @staticmethod
+    def ones() -> "RGB":
+        return RGB(1.0, 1.0, 1.0)
+
+SIGMA = RGB(0.33, 0.78, 1.89)
 S_R = 0.17
 SCALE_HEIGHT_RAYLEIGH = 2750
 
@@ -41,14 +78,13 @@ class ComplexRaycastResult:
 
 @dataclass
 class scatterResult:
-    outscatter: np.ndarray
-    inscatter: np.ndarray
+    outscatter: RGB
+    inscatter: RGB
 
-LUMINANCE_WEIGHTS = np.array([0.2126, 0.7152, 0.0722])
+LUMINANCE_WEIGHTS = RGB(0.2126, 0.7152, 0.0722)
 
-def luminance(rgb) -> float:
-    rgb = np.asarray(rgb, dtype=np.float64)
-    return float(np.dot(rgb, LUMINANCE_WEIGHTS))
+def luminance(rgb: RGB) -> float:
+    return rgb.dot(LUMINANCE_WEIGHTS)
 
 # Calculates both collision positions for the raycast
 def castRayAgainstOblateSpheroidFull(ray, width, height):
@@ -137,8 +173,7 @@ def earth_hit_km(pos_km, dir_unit):
         return None
 
     surface_m = hit.firstPosition
-    distance_km = np.linalg.norm(pos_km * 1000.0 - surface_m) / 1000.0
-    return surface_m / 1000.0, distance_km
+    return surface_m / 1000.0
 
 
 def atmosphere_segment_m(pos_km, dir_unit, sun_unit=None):
@@ -210,11 +245,11 @@ def calculateAtmosphericDimming(startPoint, endPoint, sunDirection):
     viewVector = endPoint - startPoint
     viewVectorMagnitude = np.linalg.norm(viewVector)
     if viewVectorMagnitude <= 0.0:
-        return scatterResult(outscatter=np.ones(3), inscatter=np.zeros(3))
+        return scatterResult(outscatter=RGB.ones(), inscatter=RGB.zeros())
     viewDirection = viewVector / viewVectorMagnitude
     stepSize = viewVectorMagnitude / float(NUM_SCATTER_POINTS)
 
-    inScatteredLight = np.array([0.0, 0.0, 0.0])
+    inScatteredLight = RGB.zeros()
     densityAccum = 0
     phase = phase_rayleigh(viewDirection, -sunDirection)
     sigma_r = S_R * SIGMA
@@ -243,12 +278,12 @@ def calculateAtmosphericDimming(startPoint, endPoint, sunDirection):
             sunRayOpticalDepth = opticalDepth(point, -sunDirection, sunRayLength)
             viewRayOpticalDepth = opticalDepth(point, viewDirection, t)
 
-            transmittance = np.exp(-(sunRayOpticalDepth + viewRayOpticalDepth) * sigma_r)
-            scatteredSunIntoViewRay = np.array([1.0, 1.0, 1.0]) * localDensity * transmittance * phase * sigma_r
+            transmittance = (-(sunRayOpticalDepth + viewRayOpticalDepth) * sigma_r).exp()
+            scatteredSunIntoViewRay = RGB.ones() * localDensity * transmittance * phase * sigma_r
             inScatteredLight += scatteredSunIntoViewRay * stepSize
 
     # float3 outScatterFactor = exp(-densityAccum * 0.001 * sigma_r); // sigma_r *
-    outScatterFactor = np.exp(-densityAccum * 0.001 * sigma_r)
+    outScatterFactor = (-densityAccum * 0.001 * sigma_r).exp()
     return scatterResult(outscatter=outScatterFactor, inscatter=inScatteredLight)
     # return scatterResult(outScatterFactor, inScatteredLight);
     # return rayBrightness + inScatteredLight; #densityAccum * 0.0001;
