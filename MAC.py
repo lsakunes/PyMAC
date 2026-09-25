@@ -3,6 +3,9 @@ from atmos import (
     earth_hit_km,
     atmosphere_segment_m,
     luminance,
+    SIGMA,
+    S_R,
+    reload_scatter_profile,
 )
 import numpy as np
 import cv2 as cv
@@ -13,6 +16,9 @@ from PIL import Image
 from multiprocessing import Pool, shared_memory
 from functools import partial
 import warnings
+from datetime import datetime
+from pathlib import Path
+from nrlmsise00 import msise_flat
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 import os
 num_cores = os.cpu_count()
@@ -94,10 +100,68 @@ sunc = TPC.dot(sun)
 sunimgBad = np.array([sunc[0], sunc[1]])
 sunImg = sunimgBad/np.linalg.norm(sunimgBad)
 
-atmosphere = 11  # km shell thickness (matches old ATMOSPHERE_* offset)
+atmosphere = 11  # km shell thickness; matches atmos.py ATMOSPHERE_* (+11 km) and MSIS 0–11 km table
 #endregion
 
+# NRLMSISE-00 N2/O2/Ar weighted Rayleigh table (built once at MAC startup)
+_W_N2 = 1.00
+_W_O2 = 0.91
+_W_AR = 0.858
+_ALT_MAX_KM = 11.0
+_ALT_STEP_KM = 0.25
+_MSIS_DATETIME = datetime(2009, 6, 21, 12, 0, 0)
+_LAT_DEG = 45.0
+_LON_DEG = 0.0
+_F107A = 150.0
+_F107 = 150.0
+_AP = 4.0
+_SCATTER_PROFILE_PATH = Path(__file__).resolve().parent / "scatter_profile.npz"
 
+
+def build_scatter_profile():
+    """Build MSIS-weighted beta_rgb table and write scatter_profile.npz."""
+    alt_km = np.arange(0.0, _ALT_MAX_KM + 0.5 * _ALT_STEP_KM, _ALT_STEP_KM, dtype=np.float64)
+    raw = np.asarray(
+        msise_flat(_MSIS_DATETIME, alt_km.tolist(), _LAT_DEG, _LON_DEG, _F107A, _F107, _AP),
+        dtype=np.float64,
+    )
+    n2 = raw[:, 2]
+    o2 = raw[:, 3]
+    ar = raw[:, 4]
+
+    n_w = n2 * _W_N2 + o2 * _W_O2 + ar * _W_AR
+    n_w0 = n_w[0]
+    if n_w0 <= 0.0:
+        raise RuntimeError("Sea-level weighted density N_w0 is non-positive; check MSIS output.")
+
+    beta_rgb = (S_R * SIGMA)[None, :] * (n_w / n_w0)[:, None]
+
+    np.savez(
+        _SCATTER_PROFILE_PATH,
+        alt_km=alt_km,
+        beta_rgb=beta_rgb,
+        n_N2=n2,
+        n_O2=o2,
+        n_Ar=ar,
+        n_w=n_w,
+        N_w0=np.array(n_w0),
+        weights=np.array([_W_N2, _W_O2, _W_AR]),
+        species=np.array(["N2", "O2", "Ar"]),
+    )
+    reload_scatter_profile()
+
+    def nearest(h):
+        return int(np.argmin(np.abs(alt_km - h)))
+
+    i0, i5, i11 = nearest(0.0), nearest(5.0), nearest(11.0)
+    print(f"Wrote {_SCATTER_PROFILE_PATH}")
+    print(f"alts: {alt_km[0]:.2f} .. {alt_km[-1]:.2f} km  (n={len(alt_km)})")
+    print(f"N_w0 (sea-level weighted dens): {n_w0:.6e} cm^-3")
+    for label, i in (("0 km", i0), ("5 km", i5), ("11 km", i11)):
+        print(
+            f"  {label}: N2={n2[i]:.3e}  O2={o2[i]:.3e}  Ar={ar[i]:.3e}  "
+            f"n_w/N_w0={n_w[i]/n_w0:.4f}  beta={beta_rgb[i]}"
+        )
 
 
 #region HELPER FUNCTIONS
@@ -322,6 +386,8 @@ def box(pt, pts, color, size):
     return color  
 
 if __name__ == "__main__":
+    build_scatter_profile()
+
     #region GRAPHICS
     shm = shared_memory.SharedMemory(create=True, size=xResolution*yResolution)
     a = np.ndarray((xResolution, yResolution), dtype=np.uint8, buffer=shm.buf)

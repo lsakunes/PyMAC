@@ -1,5 +1,6 @@
 import numpy as np
 from dataclasses import dataclass
+from pathlib import Path
 
 # CONSTANTS
 EARTH_WIDTH = 6378137
@@ -8,18 +9,66 @@ EARTH_HEIGHT = 6356752
 widthOverHeight = EARTH_WIDTH / EARTH_HEIGHT
 earthWidthPow2 = EARTH_WIDTH * EARTH_WIDTH
 
+# +11 km shell (matches MAC atmosphere=11); MSIS profile is 0–11 km
 ATMOSPHERE_WIDTH = 6378137 + 11000*1
 ATMOSPHERE_HEIGHT = 6356752 + 11000*1
+ATMOSPHERE_THICKNESS_M = ATMOSPHERE_HEIGHT - EARTH_HEIGHT
 
 DEG_TO_RAD = 3.14159265358979 / 180.0
 RAD_TO_DEG = 180.0 / 3.14159265358979
 
 NUM_SCATTER_POINTS = 3
+# RGB Rayleigh knobs (1/lambda^4 shape). Single source for build_scatter_profile();
+# S_R * SIGMA is sea-level RGB extinction (anchor N_w0 in the precomputed table).
 SIGMA = np.array([0.33, 0.78, 1.89])
-S_R = 0.17
-SCALE_HEIGHT_RAYLEIGH = 2750
+S_R = 1
 
 PI = 3.14159265358979323846264338327950288419716939937510582
+
+_SCATTER_PROFILE_PATH = Path(__file__).resolve().parent / "scatter_profile.npz"
+_alt_km = None
+_beta_rgb = None
+_beta_sea_level = None
+
+
+def reload_scatter_profile():
+    """Clear cached table so the next lookup reloads scatter_profile.npz from disk."""
+    global _alt_km, _beta_rgb, _beta_sea_level
+    _alt_km = None
+    _beta_rgb = None
+    _beta_sea_level = None
+
+
+def _load_scatter_profile():
+    """Load precomputed alt_km -> beta_rgb. No nrlmsise00 at render time."""
+    global _alt_km, _beta_rgb, _beta_sea_level
+    if _alt_km is not None:
+        return
+    if not _SCATTER_PROFILE_PATH.is_file():
+        raise FileNotFoundError(
+            f"Missing {_SCATTER_PROFILE_PATH.name}. "
+            "Call build_scatter_profile() from MAC before rendering."
+        )
+    data = np.load(_SCATTER_PROFILE_PATH)
+    _alt_km = np.asarray(data["alt_km"], dtype=np.float64)
+    _beta_rgb = np.asarray(data["beta_rgb"], dtype=np.float64)
+    _beta_sea_level = _beta_rgb[0].copy()
+
+
+def scattering_coefficient_rgb(altitude_m):
+    """RGB volume scattering coefficient at altitude (meters) from MSIS table."""
+    _load_scatter_profile()
+    if altitude_m < 0.0 or altitude_m > ATMOSPHERE_THICKNESS_M:
+        return np.zeros(3, dtype=np.float64)
+    alt_km = altitude_m / 1000.0
+    return np.array(
+        [
+            np.interp(alt_km, _alt_km, _beta_rgb[:, 0]),
+            np.interp(alt_km, _alt_km, _beta_rgb[:, 1]),
+            np.interp(alt_km, _alt_km, _beta_rgb[:, 2]),
+        ],
+        dtype=np.float64,
+    )
 
 @dataclass
 class Ray:
@@ -158,19 +207,17 @@ def atmosphere_segment_m(pos_km, dir_unit, sun_unit=None):
     return None
 
 
-# Returns atmospheric density at a given altitude
+# Scalar relative scattering strength (0–1 vs sea level) from MSIS table.
 # ASSUMES atmosphere is a fixed distance above the surface around the earth
-def atmospheric_density(altitude):
-    if altitude < 0.0 or altitude > (ATMOSPHERE_HEIGHT - EARTH_HEIGHT):
+def atmospheric_density(altitude_m):
+    beta = scattering_coefficient_rgb(altitude_m)
+    _load_scatter_profile()
+    denom = float(np.mean(_beta_sea_level))
+    if denom <= 0.0:
         return 0.0
+    return float(np.mean(beta) / denom)
 
-    # densityFalloff = 2.718
-    altitude0to1 = altitude / (ATMOSPHERE_WIDTH - EARTH_WIDTH)
-    # return 10e9 * 1.227 * exp(-altitude0to1 * densityFalloff) * (1 - altitude0to1)
-    return np.exp(-altitude / SCALE_HEIGHT_RAYLEIGH)
-    # return exp(-altitude0to1 / 0.25) * (1 - altitude0to1)
-
-# Calculate altitude in kilometers at point
+# Calculate altitude in meters at point
 def altitude(point):
     pointDirection = point / np.linalg.norm(point)
     pointOnEarth = castRayAgainstOblateSpheroid(Ray(point, -pointDirection), EARTH_WIDTH, EARTH_HEIGHT).position
@@ -182,17 +229,19 @@ def altitude(point):
     # return length(point - surface);
     # return length(point);
 
-# Calculate optical depth
+# RGB optical depth along a ray segment (beta = S_R*SIGMA*(n_w/N_w0) per km;
+# path lengths are in meters, so convert step to km — matches legacy *0.001).
 def opticalDepth(rayOrigin, rayDirection, rayLength):
     densitySamplePoint = rayOrigin
-    stepSize = rayLength / float(NUM_SCATTER_POINTS)
-    opticalDepth = 0.0
+    stepSize_m = rayLength / float(NUM_SCATTER_POINTS)
+    stepSize_km = stepSize_m / 1000.0
+    opticalDepthRgb = np.zeros(3, dtype=np.float64)
 
     for i in range(NUM_SCATTER_POINTS):
-        densitySamplePoint += rayDirection * stepSize
-        opticalDepth += atmospheric_density(altitude(densitySamplePoint)) * stepSize
+        densitySamplePoint += rayDirection * stepSize_m
+        opticalDepthRgb += scattering_coefficient_rgb(altitude(densitySamplePoint)) * stepSize_km
 
-    return opticalDepth
+    return opticalDepthRgb
 
 # Describes what fraction of light scatters toward the viewer based on the angle
 # between the sun and view direction.
@@ -212,17 +261,17 @@ def calculateAtmosphericDimming(startPoint, endPoint, sunDirection):
     if viewVectorMagnitude <= 0.0:
         return scatterResult(outscatter=np.ones(3), inscatter=np.zeros(3))
     viewDirection = viewVector / viewVectorMagnitude
-    stepSize = viewVectorMagnitude / float(NUM_SCATTER_POINTS)
+    stepSize_m = viewVectorMagnitude / float(NUM_SCATTER_POINTS)
+    stepSize_km = stepSize_m / 1000.0
 
     inScatteredLight = np.array([0.0, 0.0, 0.0])
-    densityAccum = 0
+    tau_view_accum_rgb = np.zeros(3, dtype=np.float64)
     phase = phase_rayleigh(viewDirection, -sunDirection)
-    sigma_r = S_R * SIGMA
     output = np.array([0.0, 0.0, 0.0])
 
     # iterating through sample points from start to end
     for i in range(NUM_SCATTER_POINTS):
-        t = float(i) * stepSize
+        t = float(i) * stepSize_m
         # slang: (t == 0 ? epsilon : (t == viewVectorMagnitude ? t - epsilon : t))
         t_sample = epsilon if t == 0.0 else (t - epsilon if t == viewVectorMagnitude else t)
         point = startPoint + t_sample * viewDirection
@@ -234,28 +283,29 @@ def calculateAtmosphericDimming(startPoint, endPoint, sunDirection):
 
         if intersectionPoint[0] == 9.0: output += np.array([1, 0, 0])
         output += np.array([0, intersectionPoint[1], intersectionPoint[2]]) * 0.0000001 / NUM_SCATTER_POINTS
-        
-        #In and out scattering
-        localDensity = atmospheric_density(altitude(point))
-        densityAccum += localDensity * stepSize
+
+        # In and out scattering — beta_rgb from MSIS N2/O2/Ar table (alt -> strength)
+        beta_rgb = scattering_coefficient_rgb(altitude(point))
+        tau_view_accum_rgb += beta_rgb * stepSize_km
 
         if not castRayAgainstOblateSpheroidFull(sunRay, EARTH_WIDTH, EARTH_HEIGHT).collidesFirst:
             sunRayOpticalDepth = opticalDepth(point, -sunDirection, sunRayLength)
             viewRayOpticalDepth = opticalDepth(point, viewDirection, t)
 
-            transmittance = np.exp(-(sunRayOpticalDepth + viewRayOpticalDepth) * sigma_r)
-            scatteredSunIntoViewRay = np.array([1.0, 1.0, 1.0]) * localDensity * transmittance * phase * sigma_r
-            inScatteredLight += scatteredSunIntoViewRay * stepSize
+            transmittance = np.exp(-(sunRayOpticalDepth + viewRayOpticalDepth))
+            scatteredSunIntoViewRay = transmittance * phase * beta_rgb
+            inScatteredLight += scatteredSunIntoViewRay * stepSize_km
 
-    # float3 outScatterFactor = exp(-densityAccum * 0.001 * sigma_r); // sigma_r *
-    outScatterFactor = np.exp(-densityAccum * 0.001 * sigma_r)
+    # beta is per km (S_R*SIGMA at sea level); no legacy *0.001 density fudge.
+    # Retune S_R (+ re-run MAC so build_scatter_profile refreshes the table) if limb/disk is too bright/dim.
+    outScatterFactor = np.exp(-tau_view_accum_rgb)
     return scatterResult(outscatter=outScatterFactor, inscatter=inScatteredLight)
     # return scatterResult(outScatterFactor, inScatteredLight);
     # return rayBrightness + inScatteredLight; #densityAccum * 0.0001;
     # return densityAccum * 0.0001;
     # return outScatterFactor;
     # return rayBrightness + inScatteredLight;
-    # * (1 - rayBrightness); 
-    #densityAccum * (1-rayBrightness); 
+    # * (1 - rayBrightness);
+    #densityAccum * (1-rayBrightness);
     #startKm * 0.0001;
     # return rayBrightness * outScatterFactor + inScatteredLight;
