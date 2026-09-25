@@ -1,3 +1,18 @@
+"""Taichi-accelerated copy of MAC.py.
+
+Only the full-image per-pixel render passes are ported to the GPU (the
+GRAPHICS region's `thingy()` fan-out, and the equivalent full-image loop in
+the ATMOS region after horizon correction) -- see GPU_ACCELERATION.md for
+why those are the bottleneck and why the rest isn't touched. The sparse
+per-horizon-point refinement loop (EDGE/MATCH regions) stays on the CPU: a
+few hundred points x a 3x3 kernel is cheap, and not worth a kernel launch.
+
+This file mirrors MAC.py region-for-region so the two can be diffed; the
+PARAMETERS/HELPER FUNCTIONS/EDGE/CRA/MATCH/RERUN CRA regions are unchanged
+except for removing the multiprocessing/shared_memory scaffolding that the
+GPU path no longer needs.
+"""
+
 #region imports
 from atmos import (
     calculateAtmosphericDimming,
@@ -10,23 +25,28 @@ from atmos import (
 )
 import numpy as np
 import cv2 as cv
-import random
-#import sympy as sp
+import taichi as ti
 import matplotlib.pyplot as plt
 from PIL import Image
-from multiprocessing import Pool, shared_memory
-from functools import partial
 import warnings
 from datetime import datetime
 from pathlib import Path
 from nrlmsise00 import msise_flat
 warnings.filterwarnings("ignore", category=RuntimeWarning)
-import os
-num_cores = os.cpu_count()
 #endregion
 
 
+# Must run before importing atmos_taichi: it declares ti.field()s at import
+# time, which requires an active Taichi runtime.
+try:
+    ti.init(arch=ti.cuda)
+except Exception:
+    try:
+        ti.init(arch=ti.vulkan)
+    except Exception:
+        ti.init(arch=ti.cpu)
 
+import atmos_taichi as at
 
 
 #region PARAMETERS
@@ -76,7 +96,7 @@ dy = focalLength/yPitch
 #############################################
 
 ### CAMERA POSITION/ORIENTATION #############
-thetay = -80
+thetay = 3.14/2
 thetax = 0
 TPCY = np.array([[np.cos(thetay),  0,  np.sin(thetay)],
                 [     0,          1,      0        ],
@@ -98,7 +118,7 @@ invKMat = np.array([[1/dx, 0, -xResolution/(2*dx)],
 
 
 ## position in world coords
-rp = np.array([-20000,0,0])
+rp = np.array([-1000,500,6300])
 ## position in camera coords
 rc = TPC.dot(rp)
 ## sun vector in camera coords
@@ -110,7 +130,7 @@ sunImg = sunimgBad/np.linalg.norm(sunimgBad)
 
 Ac = TPC.dot(Ap.dot(TCP))
 
-## the conic section we see 
+## the conic section we see
 C = ((np.outer(Ac.dot(rc),(Ac.dot(rc))) - (rc.dot(Ac.dot(rc)) * np.eye(3) - np.eye(3)).dot(Ac))*10**8)*-1
 #############################################
 
@@ -167,14 +187,14 @@ def build_scatter_profile():
         return int(np.argmin(np.abs(alt_km - h)))
 
     i0, i5, i11 = nearest(0.0), nearest(5.0), nearest(11.0)
-    print(f"Wrote {_SCATTER_PROFILE_PATH}")
-    print(f"alts: {alt_km[0]:.2f} .. {alt_km[-1]:.2f} km  (n={len(alt_km)})")
-    print(f"N_w0 (sea-level weighted dens): {n_w0:.6e} cm^-3")
-    for label, i in (("0 km", i0), ("5 km", i5), ("11 km", i11)):
-        print(
-            f"  {label}: N2={n2[i]:.3e}  O2={o2[i]:.3e}  Ar={ar[i]:.3e}  "
-            f"n_w/N_w0={n_w[i]/n_w0:.4f}  beta={beta_rgb[i]}"
-        )
+    # print(f"Wrote {_SCATTER_PROFILE_PATH}")
+    # print(f"alts: {alt_km[0]:.2f} .. {alt_km[-1]:.2f} km  (n={len(alt_km)})")
+    # print(f"N_w0 (sea-level weighted dens): {n_w0:.6e} cm^-3")
+    # for label, i in (("0 km", i0), ("5 km", i5), ("11 km", i11)):
+    #     print(
+    #         f"  {label}: N2={n2[i]:.3e}  O2={o2[i]:.3e}  Ar={ar[i]:.3e}  "
+    #         f"n_w/N_w0={n_w[i]/n_w0:.4f}  beta={beta_rgb[i]}"
+    #     )
 
 
 #region HELPER FUNCTIONS
@@ -226,7 +246,8 @@ def insideEarth(x, y, _C, _det):
         return 1
     return 0
 
-# camera position in world coords earth center
+# camera position in world coords earth center -- CPU version, kept for the
+# sparse per-horizon-point refinement loop in MATCH (not worth a GPU launch).
 def earth(pos, dir, sun):
     hit = earth_hit_km(pos, dir)
     if hit is None:
@@ -239,7 +260,6 @@ def earth(pos, dir, sun):
     return ndotl*0.5
 
 def atmos(pos, dir, sun):
-
     segment = atmosphere_segment_m(pos, dir)
     start_m, end_m = segment
     result = calculateAtmosphericDimming(start_m, end_m, sun)
@@ -276,7 +296,7 @@ def subpixelDiff(dir, origin, colorIn, img):
     xPixel = np.int32(midPixColor(img, origin[0]+horizontalSign, origin[1]))
     if (start == color):
         return 0
-    
+
     # normalize such that the largest direction of movement is independent and considered to be x
     y = 1
     if ((abs(dir[0]) > abs(dir[1]))):
@@ -286,7 +306,7 @@ def subpixelDiff(dir, origin, colorIn, img):
         y = abs(dir[0])/abs(dir[1])
         renorm = abs(dir[1])
         xPixel, yPixel = yPixel, xPixel
-    
+
     a = y*corner - y*yPixel - y*xPixel + y*start
     b = y*yPixel + xPixel - (y+1)*start
     c = start - color
@@ -297,7 +317,7 @@ def subpixelDiff(dir, origin, colorIn, img):
         # basically linear
         return (color-start)/(xPixel-start)
     t = minAbsQuadratic(a,b,c)
-    if (t == -99999): 
+    if (t == -99999):
         print(f"\n\ncolor: {color}")
         print(f"start: {start}")
         print(f"xPixel: {xPixel}")
@@ -308,36 +328,71 @@ def subpixelDiff(dir, origin, colorIn, img):
     return t/renorm
 
 
-def thingy(shm_name, shape, dtype, shm_color_name, color_shape, color_dtype, offset):
-    shm = shared_memory.SharedMemory(name=shm_name)
-    a = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
-    shmColor = shared_memory.SharedMemory(name=shm_color_name)
-    aColor = np.ndarray(color_shape, dtype=color_dtype, buffer=shmColor.buf)
-    i = 0
-    j = offset
-    while i < xResolution:
-        while j < yResolution:
-            x, y = KInv(i, j)
-            vec = np.array([x,y,1])
-            vec = vec/np.linalg.norm(vec)
-            vec = TCP.dot(vec)
-            brightness = earth(rp, vec, sun)
-            inscatter, outscatter = atmos(rp, vec, -sun)
-            # if (brightness != 0):
-            #     print(f"outscatter: {outscatter}")
-            #     print(f"inscatter: {inscatter}")
-            colorPixel = np.clip((brightness * 255)*outscatter + inscatter * 255, 0, 255)
-            aColor[j][i] = colorPixel
-            a[i][j] = luminance(colorPixel)
-            if (i%10 == 0 and j%255 == 0):
-                print(f"{i},{j} from thread {offset}")
-            if (a[j][i] > 255):
-                a[j][i] = 255
-            j += num_cores
-        j = offset
-        i += 1
-    shm.close()
-    shmColor.close()
+@ti.func
+def _earth_ti(pos: at.vec3, direction: at.vec3, sun_dir: at.vec3) -> ti.f32:
+    surface_km, hit = at.earth_hit_km(pos, direction)
+    brightness = 0.0
+    if hit:
+        surface_dir = surface_km.normalized()
+        ndotl = surface_dir.dot(sun_dir)
+        if ndotl >= 0.0:
+            brightness = ndotl * 0.5
+    return brightness
+
+
+@ti.func
+def _atmos_ti(pos: at.vec3, direction: at.vec3, sun_dir: at.vec3):
+    start, end = at.atmosphere_segment_m(pos, direction)
+    outscatter, inscatter = at.calculate_atmospheric_dimming(start, end, sun_dir)
+    return inscatter, outscatter
+
+
+@ti.kernel
+def render_kernel(
+    pos: at.vec3,
+    sun_earth: at.vec3,
+    sun_atmos: at.vec3,
+    tcp: ti.math.mat3,
+    x_res: ti.i32,
+    y_res: ti.i32,
+    dx_: ti.f32,
+    dy_: ti.f32,
+    out_lum: ti.types.ndarray(dtype=ti.f32, ndim=2),
+    out_color: ti.types.ndarray(dtype=ti.f32, ndim=3),
+):
+    """One GPU thread per pixel -- replaces thingy()'s Pool/shared_memory fan-out.
+
+    Index layout matches thingy() exactly (out_color[j, i] but out_lum[i, j],
+    i.e. the luminance buffer comes out transposed relative to the color
+    buffer) so GPU output can be diffed against the CPU path pixel-for-pixel.
+    """
+    for i, j in ti.ndrange(x_res, y_res):
+        x = (ti.cast(i, ti.f32) - ti.cast(x_res, ti.f32) * 0.5) / dx_
+        y = (ti.cast(j, ti.f32) - ti.cast(y_res, ti.f32) * 0.5) / dy_
+        ray = at.vec3(x, y, 1.0).normalized()
+        ray = tcp @ ray
+
+        brightness = _earth_ti(pos, ray, sun_earth)
+        inscatter, outscatter = _atmos_ti(pos, ray, sun_atmos)
+
+        color = ti.math.clamp(brightness * 255.0 * outscatter + inscatter * 255.0, 0.0, 255.0)
+        out_color[j, i, 0] = color.x
+        out_color[j, i, 1] = color.y
+        out_color[j, i, 2] = color.z
+        out_lum[i, j] = ti.math.clamp(at.luminance(color), 0.0, 255.0)
+
+
+def render_gpu(pos, sun_earth_dir, sun_atmos_dir):
+    """Runs render_kernel and returns (luminance uint8, color uint8) numpy arrays."""
+    lum = np.zeros((xResolution, yResolution), dtype=np.float32)
+    color = np.zeros((xResolution, yResolution, 3), dtype=np.float32)
+    render_kernel(
+        at.vec3(*pos), at.vec3(*sun_earth_dir), at.vec3(*sun_atmos_dir),
+        ti.math.mat3(TCP.tolist()),
+        xResolution, yResolution, dx, dy,
+        lum, color,
+    )
+    return lum.astype(np.uint8), color.astype(np.uint8)
 
 
 def box(pt, pts, color, size):
@@ -345,37 +400,24 @@ def box(pt, pts, color, size):
         for j in range(size*2):
             if (pt[0]+i-size, pt[1]+j-size) in pts:
                 return 0
-    return color  
+    return color
 
 #endregion
 
 
 
+#region GRAPHICS
 
 if __name__ == "__main__":
-    
-    #region GRAPHICS
     build_scatter_profile()
+    at.load_scatter_profile()
 
-    shm = shared_memory.SharedMemory(create=True, size=xResolution*yResolution)
-    a = np.ndarray((xResolution, yResolution), dtype=np.uint8, buffer=shm.buf)
-    a[:] = 0
-    shmColor = shared_memory.SharedMemory(create=True, size=xResolution*yResolution*3)
-    aColor = np.ndarray((xResolution, yResolution, 3), dtype=np.uint8, buffer=shmColor.buf)
-    aColor[:] = 0
-    with Pool(num_cores) as p:
-            p.map(partial(thingy, shm.name, a.shape, a.dtype, shmColor.name, aColor.shape, aColor.dtype), range(num_cores))
-    a = a.copy()
-    aColor = aColor.copy()
-    shm.close()
-    shm.unlink()
-    shmColor.close()
-    shmColor.unlink()
+    a, aColor = render_gpu(rp, sun, -sun)
 
     a=cv.GaussianBlur(a, (3, 3), 0)
     aColor=cv.GaussianBlur(aColor, (3, 3), 0)
     img = Image.fromarray(aColor)
-    img.save("./output.png")
+    img.save("./output_taichi.png")
     #endregion
 
 
@@ -452,23 +494,12 @@ if __name__ == "__main__":
 
 
     #region ATMOS
-    b = np.zeros((xResolution, yResolution), dtype=np.uint8)
-    bColor = np.zeros((xResolution, yResolution, 3), dtype=np.uint8)
+    # Same per-pixel cost/shape as GRAPHICS's render, just re-evaluated at the
+    # MAC-corrected earth vector -- so it goes through the same GPU kernel
+    # (sun_atmos here is sunc, not -sunc, matching the original CPU call).
+    b, bColor = render_gpu(vecToEarth, sunc, sunc)
     ptBrightness = []
 
-    for i in range(xResolution):
-        for j in range(yResolution):
-            x, y = KInv(i, j)
-            vec = np.array([x,y,1])
-            vec = vec/np.linalg.norm(vec)
-            dist = np.linalg.norm(rc)
-            brightness = earth(vecToEarth, vec, sunc)
-            b[j][i] = brightness * 255
-            atmosColor = atmos(vecToEarth, vec, sunc)
-            b[j][i] += (luminance(atmosColor))*255
-            bColor[j][i] = np.clip((brightness * 255) + atmosColor * 255, 0, 255)
-            if (b[j][i] > 255):
-                b[j][i] = 255
     b=cv.GaussianBlur(b, (3, 3), 0)
     bColor=cv.GaussianBlur(bColor, (3, 3), 0)
     modelVisual = Image.fromarray(bColor)
@@ -477,7 +508,7 @@ if __name__ == "__main__":
     kernel1d = cv.getGaussianKernel(3, 0)
     kernel2d = np.outer(kernel1d, kernel1d.transpose())
     for pt in pts:
-    
+
         brightness = 0
         for k in range(3):
             for l in range(3):
@@ -575,4 +606,4 @@ if __name__ == "__main__":
 
     #endregion
 
-    print("ran test 36")
+    print("ran test 36 (taichi)")
