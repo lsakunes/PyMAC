@@ -23,6 +23,7 @@ from atmos import (
     S_R,
     reload_scatter_profile,
 )
+import os
 import numpy as np
 import cv2 as cv
 import taichi as ti
@@ -153,6 +154,9 @@ _SCATTER_PROFILE_PATH = Path(__file__).resolve().parent / "scatter_profile.npz"
 
 def build_scatter_profile():
     """Build MSIS-weighted beta_rgb table and write scatter_profile.npz."""
+    if os.path.isfile(_SCATTER_PROFILE_PATH):
+        print("File exists and is a file.")
+        return
     alt_km = np.arange(0.0, _ALT_MAX_KM + 0.5 * _ALT_STEP_KM, _ALT_STEP_KM, dtype=np.float64)
     raw = np.asarray(
         msise_flat(_MSIS_DATETIME, alt_km.tolist(), _LAT_DEG, _LON_DEG, _F107A, _F107, _AP),
@@ -182,19 +186,6 @@ def build_scatter_profile():
         species=np.array(["N2", "O2", "Ar"]),
     )
     reload_scatter_profile()
-
-    def nearest(h):
-        return int(np.argmin(np.abs(alt_km - h)))
-
-    i0, i5, i11 = nearest(0.0), nearest(5.0), nearest(11.0)
-    # print(f"Wrote {_SCATTER_PROFILE_PATH}")
-    # print(f"alts: {alt_km[0]:.2f} .. {alt_km[-1]:.2f} km  (n={len(alt_km)})")
-    # print(f"N_w0 (sea-level weighted dens): {n_w0:.6e} cm^-3")
-    # for label, i in (("0 km", i0), ("5 km", i5), ("11 km", i11)):
-    #     print(
-    #         f"  {label}: N2={n2[i]:.3e}  O2={o2[i]:.3e}  Ar={ar[i]:.3e}  "
-    #         f"n_w/N_w0={n_w[i]/n_w0:.4f}  beta={beta_rgb[i]}"
-    #     )
 
 
 #region HELPER FUNCTIONS
@@ -246,8 +237,7 @@ def insideEarth(x, y, _C, _det):
         return 1
     return 0
 
-# camera position in world coords earth center -- CPU version, kept for the
-# sparse per-horizon-point refinement loop in MATCH (not worth a GPU launch).
+# camera position in world coords earth center -- CPU version
 def earth(pos, dir, sun):
     hit = earth_hit_km(pos, dir)
     if hit is None:
@@ -360,16 +350,11 @@ def render_kernel(
     out_lum: ti.types.ndarray(dtype=ti.f32, ndim=2),
     out_color: ti.types.ndarray(dtype=ti.f32, ndim=3),
 ):
-    """One GPU thread per pixel -- replaces thingy()'s Pool/shared_memory fan-out.
-
-    Index layout matches thingy() exactly (out_color[j, i] but out_lum[i, j],
-    i.e. the luminance buffer comes out transposed relative to the color
-    buffer) so GPU output can be diffed against the CPU path pixel-for-pixel.
-    """
     for i, j in ti.ndrange(x_res, y_res):
         x = (ti.cast(i, ti.f32) - ti.cast(x_res, ti.f32) * 0.5) / dx_
         y = (ti.cast(j, ti.f32) - ti.cast(y_res, ti.f32) * 0.5) / dy_
         ray = at.vec3(x, y, 1.0).normalized()
+        # convert view ray from camera to world coords
         ray = tcp @ ray
 
         brightness = _earth_ti(pos, ray, sun_earth)
@@ -418,6 +403,7 @@ if __name__ == "__main__":
     aColor=cv.GaussianBlur(aColor, (3, 3), 0)
     img = Image.fromarray(aColor)
     img.save("./output_taichi.png")
+    print("generated image")
     #endregion
 
 
