@@ -17,11 +17,13 @@ ATMOSPHERE_THICKNESS_M = ATMOSPHERE_HEIGHT - EARTH_HEIGHT
 DEG_TO_RAD = 3.14159265358979 / 180.0
 RAD_TO_DEG = 180.0 / 3.14159265358979
 
-NUM_SCATTER_POINTS = 3
+NUM_SCATTER_POINTS = 6
 
 
 SIGMA = np.array([0.33, 0.78, 1.89])
-S_R = 0.17
+S_R = 0.02
+# Disk rays keep the strength from before the limb was dimmed.
+SURFACE_S_R = 0.17
 SCALE_HEIGHT_RAYLEIGH = 2750
 
 PI = 3.14159265358979323846264338327950288419716939937510582
@@ -56,13 +58,13 @@ def _load_scatter_profile():
     _beta_sea_level = _beta_rgb[0].copy()
 
 
-def scattering_coefficient_rgb(altitude_m):
+def scattering_coefficient_rgb(altitude_m, scale=1.0):
     """RGB volume scattering coefficient at altitude (meters) from MSIS table."""
     _load_scatter_profile()
     if altitude_m < 0.0 or altitude_m > ATMOSPHERE_THICKNESS_M:
         return np.zeros(3, dtype=np.float64)
     alt_km = altitude_m / 1000.0
-    return np.array(
+    return scale * np.array(
         [
             np.interp(alt_km, _alt_km, _beta_rgb[:, 0]),
             np.interp(alt_km, _alt_km, _beta_rgb[:, 1]),
@@ -96,8 +98,9 @@ class scatterResult:
 
 LUMINANCE_WEIGHTS = np.array([0.2126, 0.7152, 0.0722])
 
-def luminance(rgb: np.array) -> float:
-    return rgb.dot(LUMINANCE_WEIGHTS)
+def luminance(rgb) -> float:
+    rgb = np.asarray(rgb, dtype=np.float64)
+    return float(np.dot(rgb, LUMINANCE_WEIGHTS))
 
 # Calculates both collision positions for the raycast
 def castRayAgainstOblateSpheroidFull(ray, width, height):
@@ -189,12 +192,21 @@ def earth_hit_km(pos_km, dir_unit):
 
 
 def atmosphere_segment_m(pos_km, dir_unit):
+    """Returns (start_m, end_m) through the atmosphere, or None if the ray misses."""
     ray = _mac_ray(pos_km, dir_unit)
 
     earth_hit = castRayAgainstOblateSpheroidFull(ray, EARTH_WIDTH, EARTH_HEIGHT)
     atmos_hit = castRayAgainstOblateSpheroidFull(ray, ATMOSPHERE_WIDTH, ATMOSPHERE_HEIGHT)
 
-    return atmos_hit.firstPosition, earth_hit.firstPosition
+    # Hit Earth: march from atmosphere entry to surface
+    if earth_hit.collidesFirst and atmos_hit.collidesFirst:
+        return atmos_hit.firstPosition, earth_hit.firstPosition
+
+    # Limb only: march through the atmosphere shell (entry → exit)
+    if atmos_hit.collidesFirst and atmos_hit.collidesSecond and not earth_hit.collidesFirst:
+        return atmos_hit.firstPosition, atmos_hit.secondPosition
+
+    return None
 
 
 # Scalar relative scattering strength (0–1 vs sea level) from MSIS table.
@@ -221,7 +233,7 @@ def altitude(point):
 
 # RGB optical depth along a ray segment (beta = S_R*SIGMA*(n_w/N_w0) per km;
 # path lengths are in meters, so convert step to km — matches legacy *0.001).
-def opticalDepth(rayOrigin, rayDirection, rayLength):
+def opticalDepth(rayOrigin, rayDirection, rayLength, scale=1.0):
     densitySamplePoint = rayOrigin
     stepSize_m = rayLength / float(NUM_SCATTER_POINTS)
     stepSize_km = stepSize_m / 1000.0
@@ -229,7 +241,7 @@ def opticalDepth(rayOrigin, rayDirection, rayLength):
 
     for i in range(NUM_SCATTER_POINTS):
         densitySamplePoint += rayDirection * stepSize_m
-        opticalDepthRgb += scattering_coefficient_rgb(altitude(densitySamplePoint)) * stepSize_km
+        opticalDepthRgb += scattering_coefficient_rgb(altitude(densitySamplePoint), scale) * stepSize_km
 
     return opticalDepthRgb
 
@@ -244,7 +256,7 @@ def phase_rayleigh(view_dir, rayDir):
 # inputs should be in meters
 # ray brightness is the brightness of the ray at the start point
 # this function returns the brightness of the ray at the end point after going through the atmopshere
-def calculateAtmosphericDimming(startPoint, endPoint, sunDirection):
+def calculateAtmosphericDimming(startPoint, endPoint, sunDirection, scale=1.0):
     epsilon = 10
     viewVector = endPoint - startPoint
     viewVectorMagnitude = np.linalg.norm(viewVector)
@@ -274,13 +286,13 @@ def calculateAtmosphericDimming(startPoint, endPoint, sunDirection):
         if intersectionPoint[0] == 9.0: output += np.array([1, 0, 0])
         output += np.array([0, intersectionPoint[1], intersectionPoint[2]]) * 0.0000001 / NUM_SCATTER_POINTS
 
-        # In and out scattering — beta_rgb from MSIS N2/O2/Ar table (alt -> strength)
-        beta_rgb = scattering_coefficient_rgb(altitude(point)) * S_R
+        # In and out scattering — beta_rgb from MSIS N2/O2/Ar table (already includes S_R*SIGMA)
+        beta_rgb = scattering_coefficient_rgb(altitude(point), scale)
         tau_view_accum_rgb += beta_rgb * stepSize_km
 
         if not castRayAgainstOblateSpheroidFull(sunRay, EARTH_WIDTH, EARTH_HEIGHT).collidesFirst:
-            sunRayOpticalDepth = opticalDepth(point, -sunDirection, sunRayLength)
-            viewRayOpticalDepth = opticalDepth(point, viewDirection, t)
+            sunRayOpticalDepth = opticalDepth(point, -sunDirection, sunRayLength, scale)
+            viewRayOpticalDepth = opticalDepth(point, viewDirection, t, scale)
 
             transmittance = np.exp(-(sunRayOpticalDepth + viewRayOpticalDepth))
             scatteredSunIntoViewRay = transmittance * phase * beta_rgb

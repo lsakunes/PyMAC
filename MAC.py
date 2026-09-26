@@ -6,6 +6,7 @@ from atmos import (
     luminance,
     SIGMA,
     S_R,
+    SURFACE_S_R,
     reload_scatter_profile,
 )
 import numpy as np
@@ -63,7 +64,7 @@ Ap = diagTrueInvAxes*diagTrueInvAxes
 #############################################
 
 ### CAMERA INTRINSICS #######################
-focalLength     = 50 * 0.001 # 50mm to m
+focalLength     = 350 * 0.001 # 350mm to m; 11 km shell is ~48 px from 400 km
 sensorWidth     = 36 * 0.001 # 36mm to m
 sensorHeight    = 36 * 0.001 # 36mm to m
 xResolution     = 1024
@@ -76,8 +77,15 @@ dy = focalLength/yPitch
 #############################################
 
 ### CAMERA POSITION/ORIENTATION #############
-thetay = -80
-thetax = 0
+# 400 km LEO. Yaw puts the center pixel midway through the 11 km shell;
+# +90° roll lays that band across the frame with sky above and Earth below.
+altitude_km = 400.0
+horizon_depression_deg = np.degrees(np.arccos(axes[0] / (axes[0] + altitude_km)))
+shell_top_depression_deg = np.degrees(np.arccos((axes[0] + atmosphere) / (axes[0] + altitude_km)))
+aim_depression_deg = 0.5 * (horizon_depression_deg + shell_top_depression_deg)
+thetay = np.deg2rad(180.0 - aim_depression_deg)
+thetax = 0.0
+roll = np.deg2rad(90.0)
 TPCY = np.array([[np.cos(thetay),  0,  np.sin(thetay)],
                 [     0,          1,      0        ],
                 [-np.sin(thetay),  0,  np.cos(thetay)]])
@@ -85,7 +93,10 @@ TPCY = np.array([[np.cos(thetay),  0,  np.sin(thetay)],
 TPCX = np.array([[1,  0,  0],
                 [0, np.cos(thetax), -np.sin(thetax)],
                 [0, np.sin(thetax),  np.cos(thetax)]])
-TPC = TPCX.dot(TPCY)
+TPCZ = np.array([[np.cos(roll), -np.sin(roll), 0],
+                 [np.sin(roll),  np.cos(roll), 0],
+                 [0, 0, 1]])
+TPC = TPCZ.dot(TPCX.dot(TPCY))
 TCP = np.linalg.matrix_transpose(TPC)
 
 
@@ -97,8 +108,8 @@ invKMat = np.array([[1/dx, 0, -xResolution/(2*dx)],
                     [0,0,1]])
 
 
-## position in world coords
-rp = np.array([-20000,0,0])
+## position in world coords (equator, altitude_km above the surface)
+rp = np.array([-(axes[0] + altitude_km), 0, 0])
 ## position in camera coords
 rc = TPC.dot(rp)
 ## sun vector in camera coords
@@ -239,10 +250,14 @@ def earth(pos, dir, sun):
     return ndotl*0.5
 
 def atmos(pos, dir, sun):
-
     segment = atmosphere_segment_m(pos, dir)
+    if segment is None:
+        return np.zeros(3), np.ones(3)
     start_m, end_m = segment
-    result = calculateAtmosphericDimming(start_m, end_m, sun)
+    # Limb-only rays stay at S_R. Rays that hit the ground use the old strength
+    # so dimming the glow does not flatten the disk.
+    beta_scale = (SURFACE_S_R / S_R) if earth_hit_km(pos, dir) is not None else 1.0
+    result = calculateAtmosphericDimming(start_m, end_m, sun, beta_scale)
     return result.inscatter, result.outscatter
 
 # in pixel coords
@@ -426,7 +441,7 @@ if __name__ == "__main__":
 
 
     #region CRA
-    imageToSpace = diagInvAxes.dot(TPCY.transpose()).dot(invKMat)
+    imageToSpace = diagInvAxes.dot(TCP).dot(invKMat)
     pointsSize = len(pts)
     normalizedVecsToHorizonMat = np.zeros((pointsSize, 3), dtype=np.float32)
     for i in range(pointsSize):
@@ -436,9 +451,16 @@ if __name__ == "__main__":
         for j in range(3):
             normalizedVecsToHorizonMat[i, j] = normalizedVecToHorizon[j]
     vecToEarth = np.linalg.lstsq(normalizedVecsToHorizonMat, np.ones(pointsSize, dtype=np.float32), rcond=None)[0]
-    vecToEarth = (TPC.dot(diagAxes).dot(vecToEarth)) * (1/np.sqrt(vecToEarth.dot(vecToEarth) - 1))
-    print(f"error: {rc-vecToEarth}")
-    print(f"error: {np.linalg.norm(rc)-np.linalg.norm(vecToEarth)}")
+    denom = vecToEarth.dot(vecToEarth) - 1
+    if pointsSize < 3 or denom <= 0:
+        print(f"error: [nan nan nan]")
+        print(f"error: nan")
+        print("CRA skipped: insufficient/invalid horizon points")
+        vecToEarth = rc.copy()
+    else:
+        vecToEarth = (TPC.dot(diagAxes).dot(vecToEarth)) * (1/np.sqrt(denom))
+        print(f"error: {rc-vecToEarth}")
+        print(f"error: {np.linalg.norm(rc)-np.linalg.norm(vecToEarth)}")
     sBar = KMat.dot(vecToEarth/vecToEarth[2])
 
     C = ((np.outer(Ac.dot(vecToEarth),(Ac.dot(vecToEarth))) - (vecToEarth.dot(Ac.dot(vecToEarth)) * np.eye(3) - np.eye(3)).dot(Ac)))
@@ -461,14 +483,11 @@ if __name__ == "__main__":
             x, y = KInv(i, j)
             vec = np.array([x,y,1])
             vec = vec/np.linalg.norm(vec)
-            dist = np.linalg.norm(rc)
             brightness = earth(vecToEarth, vec, sunc)
-            b[j][i] = brightness * 255
-            atmosColor = atmos(vecToEarth, vec, sunc)
-            b[j][i] += (luminance(atmosColor))*255
-            bColor[j][i] = np.clip((brightness * 255) + atmosColor * 255, 0, 255)
-            if (b[j][i] > 255):
-                b[j][i] = 255
+            inscatter, outscatter = atmos(vecToEarth, vec, sunc)
+            colorPixel = np.clip((brightness * 255) * outscatter + inscatter * 255, 0, 255)
+            b[j][i] = np.clip(luminance(colorPixel), 0, 255)
+            bColor[j][i] = colorPixel
     b=cv.GaussianBlur(b, (3, 3), 0)
     bColor=cv.GaussianBlur(bColor, (3, 3), 0)
     modelVisual = Image.fromarray(bColor)
@@ -484,9 +503,10 @@ if __name__ == "__main__":
                 x, y = KInv(pt[0]+k-1, pt[1]+l-1)
                 vec = np.array([x,y,1])
                 vec = vec/np.linalg.norm(vec)
-                dist = np.linalg.norm(rc)
-                dummy, surface = earth(vecToEarth, vec, sunc)
-                brightness += (luminance(atmos(vecToEarth, vec, sunc))*255) * kernel2d[k][l]
+                e = earth(vecToEarth, vec, sunc)
+                inscatter, outscatter = atmos(vecToEarth, vec, sunc)
+                colorPixel = np.clip((e * 255) * outscatter + inscatter * 255, 0, 255)
+                brightness += luminance(colorPixel) * kernel2d[k][l]
         if (brightness > 255):
                 brightness = 255
         ptBrightness.append(brightness)
@@ -497,12 +517,12 @@ if __name__ == "__main__":
                 x, y = KInv((int)(pt[0])+k-1, (int)(pt[1])+l-1)
                 vec = np.array([x,y,1])
                 vec = vec/np.linalg.norm(vec)
-                dist = np.linalg.norm(rc)
-                dummy, surface = earth(vecToEarth, vec, sunc)
-                atmosColor = atmos(vecToEarth, vec, sunc)
-                brightness += (luminance(atmosColor)*255) * kernel2d[k][l]
-                colorBrightness += (atmosColor*255) * kernel2d[k][l]
-        b[(int)(pt[1]), (int)(pt[0])] = brightness
+                e = earth(vecToEarth, vec, sunc)
+                inscatter, outscatter = atmos(vecToEarth, vec, sunc)
+                colorPixel = np.clip((e * 255) * outscatter + inscatter * 255, 0, 255)
+                brightness += luminance(colorPixel) * kernel2d[k][l]
+                colorBrightness += colorPixel * kernel2d[k][l]
+        b[(int)(pt[1]), (int)(pt[0])] = np.clip(brightness, 0, 255)
         bColor[(int)(pt[1]), (int)(pt[0])] = np.clip(colorBrightness, 0, 255)
 
     modelVisual = Image.fromarray(bColor)
@@ -558,7 +578,7 @@ if __name__ == "__main__":
 
 
     #region RERUN CRA
-    imageToSpace = diagTrueInvAxes.dot(TPCY.transpose()).dot(invKMat)
+    imageToSpace = diagTrueInvAxes.dot(TCP).dot(invKMat)
     pointsSize = len(pts)
     normalizedVecsToHorizonMat = np.zeros((pointsSize, 3), dtype=np.float32)
     for i in range(pointsSize):
@@ -568,9 +588,13 @@ if __name__ == "__main__":
         for j in range(3):
             normalizedVecsToHorizonMat[i, j] = normalizedVecToHorizon[j]
     vecToEarth = np.linalg.lstsq(normalizedVecsToHorizonMat, np.ones(pointsSize, dtype=np.float32), rcond=None)[0]
-    vecToEarth = (TPC.dot(diagTrueAxes).dot(vecToEarth)) * (1/np.sqrt(vecToEarth.dot(vecToEarth) - 1))
-    print(f"MAC adjusted error: {rc-vecToEarth}")
-    print(f"MAC adjusted error: {np.linalg.norm(rc)-np.linalg.norm(vecToEarth)}")
+    denom = vecToEarth.dot(vecToEarth) - 1
+    if pointsSize < 3 or denom <= 0:
+        print("MAC adjusted error: nan (CRA skipped)")
+    else:
+        vecToEarth = (TPC.dot(diagTrueAxes).dot(vecToEarth)) * (1/np.sqrt(denom))
+        print(f"MAC adjusted error: {rc-vecToEarth}")
+        print(f"MAC adjusted error: {np.linalg.norm(rc)-np.linalg.norm(vecToEarth)}")
 
 
     #endregion
